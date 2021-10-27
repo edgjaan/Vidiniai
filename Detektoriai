@@ -18,6 +18,7 @@ library(nnet)
 library(lda)
 library(tidyr)
 library(arulesCBA)
+library
 library(naivebayes)
 
 getwd()

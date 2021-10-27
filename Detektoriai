@@ -19,6 +19,7 @@ library(lda)
 library(tidyr)
 library(arulesCBA)
 library(naivebayes)
+library
 
 getwd()
 setwd("C:/Users/edgar/OneDrive/Desktop/Vidiniu verslo duomenu analitikos projektas/Komandinis")

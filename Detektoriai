@@ -1,0 +1,284 @@
+if (!"pacman" %in% rownames(installed.packages())) install.packages("pacman")
+require(pacman)
+pacman::p_load(DRR, doParallel, tibble, caret, e1071, randomForest, mlr, tuneRanger, glmnetUtils, MASS, FNN, RSNNS, tidyr, precrec, PresenceAbsence)
+#pacman::p_load(neuralnet, nnet)
+no_cores <- max(1,detectCores()-1)
+cl <- makeCluster(no_cores)
+registerDoParallel(cl)
+if (!"ROC" %in% rownames(installed.packages())) {
+  pacman::p_load(githubinstall)
+  githubinstall("ROC",ask=F)
+  #pacman::p_load(devtools)
+  #install_github("davidavdav/ROC")
+}
+pacman::p_load(ROC)
+
+library(neuralnet)
+library(nnet)
+library(lda)
+library(tidyr)
+library(arulesCBA)
+library(naivebayes)
+
+getwd()
+setwd("C:/Users/edgar/OneDrive/Desktop/Vidiniu verslo duomenu analitikos projektas/Komandinis")
+
+# converts all factors to numeric type, if levels>3 dummyVars could be considered
+#factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)], as.numeric))
+
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.factor)], function(x) as.numeric(x)-1))
+
+TIME <- Sys.time()
+myData <- read.csv('develop.csv',header=T)
+#myData <- D[,-which(colnames(D) %in% c("State","Phone"))]
+#rm(D)
+
+
+myData2 <- names(myData) %in% c("Branch", "Res")
+newdata <- myData[!myData2]
+
+str(newdata)
+
+myData <- newdata
+
+str(myData)
+
+library(psych)
+str(myData)
+dim(myData)
+psych::describe(myData)
+psych::describeBy(myData, myData$Ins)
+#pepsi - 630 / coke - 510
+
+colY <- "Ins"
+idxY <- which(colnames(myData) %in% colY)
+myData[,idxY] <- factor(myData[,idxY],labels=c("False","True"))
+
+nmd <- names(myData) # formulas - long for neuralnet, short for logit and LDA
+formulaLong <- as.formula(paste(paste(colY," ~",sep=""), paste(nmd[!nmd %in% colY], collapse = " + ")))
+formulaShort <- as.formula(paste(paste(colY,".",sep="~")))  
+
+# prepare data normalization routine
+procValues <- preProcess(factorsNumeric(myData[,-idxY]), method = c("center", "scale"))
+
+#classical random forest settings
+mtry <- floor(sqrt(ncol(myData)-1))
+ntree <- 500
+ptree <- 100
+
+# glmnet settings
+alphaSeq <- seq(0,1,len=21)^3
+
+#random forest settings for tuneRanger
+tuneParams <- c("mtry", "min.node.size")
+itersWarm <- 11
+itersTune <- 19
+tuneRangerMeasure <- list(mlr::logloss)
+tuneRangerMeasureTxt <- "logloss" # auc ok if no class imbalance
+
+# k-NN and neural settings
+knn_neighs <- 150
+hiddenSize <- 15
+
+
+kCV <- 3 # number of outter CV folds (using stratification by label)
+myFolds <- createFolds(myData[,colY],kCV)
+
+# SVM tuning settings
+ctrl <- trainControl(method="cv", number=kCV, summaryFunction=mnLogLoss, classProbs=T, allowParallel = T) # twoClassSummary or mnLogLoss ? 
+caretTrainMetric <- "logLoss" # ROC or logLoss ?
+sigmas <- sigest(formulaShort, myData, frac = 1, scaled = T)
+#sigmaValues <- round(as.numeric(sigmas),4)
+sigmaValues <- round(seq(sigmas[1],sigmas[3],length=5),4)
+gridRBF <- expand.grid(sigma = sigmaValues, C = 2^c(-3:3))
+gridLin <- expand.grid(C = 2^seq(-3,3,by=0.5))
+
+
+gc()
+myResults <- NULL
+
+for (i in 1:kCV) {
+  
+  tstInd <- myFolds[[i]]
+  trnIdx <- as.logical(rep(1,1,nrow(myData)))
+  trnIdx[tstInd] <- FALSE
+  trnInd <- which(trnIdx)
+  target <- as.logical(myData[tstInd,idxY])
+  
+  trnDataProc <- predict(procValues, factorsNumeric(myData[trnInd,-idxY]))
+  # trnDataProc1 <- predict(procValues, factorsNumeric(myData[trnInd,]))
+  tstDataProc <- predict(procValues, factorsNumeric(myData[tstInd,-idxY]))
+  
+  
+  # str(trnDataProc)
+  # str(tstDataProc)
+  
+  Y <- myData[trnInd,idxY]
+  classProps <- as.numeric(prop.table(table(Y)))
+  sampfrac <- 2*min(classProps)*0.632
+  W <- rep(NA, length(Y))
+  W[Y=="False"] <- classProps[2]
+  W[Y=="True"] <- classProps[1]
+  
+
+  #PIRMAS
+  # cat(sprintf("\nCV fold %d out of %d / Linear Discriminant Analysis\n", i, kCV))
+  # lda_model <- lda(formulaShort,data=cbind(trnDataProc,Ins=Y))
+  # model <- rep("LDA",length(target))
+  # soft <- predict(lda_model,tstDataProc)
+  # score <- soft$posterior[,2]
+  # myResults <- rbind(myResults,data.frame(tstInd, model,score,target))
+  # rm(lda_model)
+  
+  
+  # #ANTRAS
+  # cat(sprintf("\nCV fold %d out of %d / Random Forest\n", i, kCV))
+  # model_classwt <- prop.table(table(Y))
+  # # rf_model <- randomForest(myData[trnInd,-idxY], Y, ntree = ntree, mtry = mtry, classwt = model_classwt, cutoff = model_classwt, strata = Y, replace = FALSE, importance=FALSE, do.trace = ptree)
+  # rf_model <- tuneRF(myData[trnInd,-idxY], Y, mtryStart = mtry, ntreeTry = ntree,
+  #                    stepFactor = 2, improve = 0.01, plot=FALSE, doBest=T,
+  #                    strata = Y, replace = FALSE, importance=FALSE, do.trace = ptree)
+  # print(rf_model)
+  # model <- rep("RF",length(target))
+  # score <- predict(rf_model,myData[tstInd,-idxY],type="prob")[,2]
+  # myResults <- rbind(myResults,data.frame(tstInd,model,score,target))
+  # rm(rf_model) 
+  
+  #TRECIAS
+  # cat(sprintf("\nCV fold %d out of %d / Random Forest - cost sensitive learning\n", i, kCV))
+  # model_classwt <- prop.table(table(Y))
+  # rf_model <- tuneRF(myData[trnInd,-idxY], Y, mtryStart = mtry, ntreeTry = ntree,
+  #                    stepFactor = 2, improve = 0.01, plot=FALSE, doBest=T,
+  #                    classwt = model_classwt, cutoff = model_classwt,
+  #                    strata = Y, replace = FALSE, importance=FALSE, do.trace = ptree)
+  # print(rf_model)
+  # model <- rep("RF-csl",length(target))
+  # score <- predict(rf_model,myData[tstInd,-idxY],type="prob")[,2]
+  # myResults <- rbind(myResults,data.frame(tstInd,model,score,target))
+  # rm(rf_model)
+  
+  
+  #KETVIRTAS
+  # cat(sprintf("\nCV fold %d out of %d / Logistic Regression\n", i, kCV))
+  # logit_model <- glm(formulaShort,family=binomial(link='logit'),data=myData[trnInd,])
+  # model <- rep("Logit",length(target))
+  # score <- predict(logit_model,myData[tstInd,-idxY],type="response")
+  # myResults <- rbind(myResults,data.frame(tstInd,model,score,target))
+  # rm(logit_model)
+
+  #PENKTAS
+  # cat(sprintf("\nCV fold %d out of %d / k-Nearest Neighbors\n", i, kCV))
+  # knn_model <- knn(trnDataProc, tstDataProc, Y, k = knn_neighs, prob = T, algorithm = "kd_tree")
+  # model <- rep("kNN",length(target))
+  # score <- 1-abs(as.numeric(knn_model)-1-attr(knn_model,"prob"))
+  # myResults <- rbind(myResults,data.frame(tstInd,model,score,target))
+  # rm(knn_model)
+  
+  #SESTAS
+  # cat(sprintf("\nCV fold %d out of %d / SVM with RBF kernel\n", i, kCV))
+  # svm_model <- caret::train(formulaShort, data = cbind(trnDataProc1,Churn=trnDataProc1$Ins),
+  #                           method = "svmRadialSigma", metric=caretTrainMetric,
+  #                           tuneGrid = gridRBF, trControl = ctrl)
+  # print(svm_model)
+  # model <- rep("SVM-RBF", length(target))
+  # score <- predict(svm_model, tstDataProc, type="prob")[,2]
+  # myResults <- rbind(myResults,data.frame(tstInd, model,score,target))
+  # rm(svm_model)
+  
+  #SEPTINTAS
+  # cat(sprintf("\nCV fold %d out of %d / Neural Network (RSNNS package)\n", i, kCV))
+  # SNNS_model <- mlp(trnDataProc, as.numeric(Y)-1, size = hiddenSize, linOut = FALSE, maxit = 1000, shufflePatterns = FALSE,  learnFunc = "Rprop")
+  # model <- rep("SNNS",length(target))
+  # score <- predict(SNNS_model,tstDataProc)
+  # myResults <- rbind(myResults,data.frame(tstInd, model,score,target))
+  # rm(SNNS_model)
+
+  
+  #ASTUNTAS
+  # cat(sprintf("\nCV fold %d out of %d / NAIVE BAYES\n", i, kCV))
+  # model_naive <- naive_bayes(myData[trnInd,-idxY], Y, data = trnDataProc, usekernel = T)
+  # model <- rep("NAIVE",length(target))
+  # score<-predict(model_naive,myData[tstInd,-idxY], type = 'prob')[,2]
+  # myResults <- rbind(myResults,data.frame(tstInd,model,score,target))
+  
+  
+  trnDataProc1 <- predict(procValues, factorsNumeric(myData[trnInd,]))
+  tstDataProc1 <- predict(procValues, factorsNumeric(myData[tstInd,]))
+  trnDataProc1$Ins<-as.factor(trnDataProc1$Ins)
+  tstDataProc1$Ins<-as.factor(tstDataProc1$Ins)
+  
+  model_classwt <- prop.table(table(Y))
+  
+  
+  cat(sprintf("\nCV fold %d out of %d / CLASS BASED ASSOCIATIONS - CBA\n", i, kCV))
+  assoc<-bCBA(formulaShort, data=trnDataProc1, gamma=5,cost=15, parameter = NULL, control = NULL, sort.parameter = NULL, lhs.support = TRUE,
+              class.weights = model_classwt, disc.method = "mdlp", verbose = FALSE)
+  model <- rep("CBA",length(target))
+  score<-predict(assoc,tstDataProc1,type="class")#test
+  myResults <- rbind(myResults,data.frame(tstInd,model,score,target))
+  rm(assoc)
+
+}
+
+print(Sys.time() - TIME)
+
+
+myModels <- levels(myResults[,"model"])
+myScores <- spread(myResults, model, score)
+
+
+TIME <- Sys.time()
+# confusion matrix @ EER threshold
+myF <- NULL
+numScores <- myScores
+numScores$target <- as.numeric(numScores$target)
+opt.thr <- optimal.thresholds(DATA = numScores, model.names = myModels, opt.methods = "Sens=Spec")
+cat('\n')
+print(data.frame(Threshold=t(opt.thr[-1])))
+cat('\n')
+for (model in myModels) {
+  #opt.cut.result <- optimal.cutpoints(X = model, status = "target", tag.healthy = 0, methods = "SpEqualSe", data = myScores, trace = T)
+  #threshold <- opt.cut.result$SpEqualSe$Global$optimal.cutoff$cutoff
+  threshold <- opt.thr[1,model]
+  confusionMatrix <- caret::confusionMatrix(as.factor(myScores[,model]>=threshold),as.factor(as.logical(myScores$target)),positive="TRUE",mode="everything")
+  cat(paste0(model,'\n'))
+  print(confusionMatrix)
+  myF <- c(myF,as.numeric(confusionMatrix$byClass['F1']))
+}
+print(Sys.time() - TIME)
+cat('\n')
+
+TIME <- Sys.time()
+
+# ROC curves
+myModelNames <- NULL
+i <- 1
+performance <- roc.plot(myResults[myResults[,"model"]==myModels[i],],i,traditional=T)
+myModelNames[i] <- sprintf('%s AUC=%5.3f',myModels[i],1-performance['pAUC'])
+for (i in 2:length(myModels)) {
+  performance <- roc.plot(myResults[myResults[,"model"]==myModels[i],],i,traditional=T)
+  myModelNames[i] <- sprintf('%s AUC=%5.3f',myModels[i],1-performance['pAUC'])
+}
+legend(0.4,0.55,myModelNames,lty=rep(1,1,length(myModels)),col=1:length(myModels),cex=0.8)
+
+# DET curves
+myModelNames <- NULL
+det.plot(NULL,1,xmax=70,ymax=70)
+for (i in 1:length(myModels)) {
+  performance <- det.plot(myResults[myResults[,"model"]==myModels[i],],nr=i+1)
+  myModelNames[i] <- sprintf('%s EER=%5.2f%%',myModels[i],performance['eer'])
+}
+legend(log(0.042),log(0.28),myModelNames,lty=rep(1,1,length(myModels)),col=2:(length(myModels)+1),cex=0.8)
+
+# Precision-Recall curves
+myScores <- spread(myResults, model, score)
+myLegend <- paste0(myModels, " F1=", format(myF,digits=3))
+msmdat <- mmdata(myScores[,-c(1,2)], myScores[,2], posclass = T, modnames = myLegend)
+plot(autoplot(evalmod(msmdat), "PRC", type="b"))
+
+# save scores for uploading to http://www.biosoft.hacettepe.edu.tr/easyROC/
+myScores$target <- as.numeric(myScores$target)
+write.csv(myScores,file="churn_scores_for_easyROC_analysis.csv")
+
+print(Sys.time() - TIME)
+
